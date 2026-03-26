@@ -2,15 +2,19 @@
 """
 epub_to_audiobook.py
 --------------------
-Convert an epub file to MP3 chapters using Kokoro TTS.
+Convert epub files to MP3 + WAV audiobook chapters using Kokoro TTS.
 Outputs are ready to copy to a Kindle.
 
-Requirements:
-    pip install ebooklib beautifulsoup4 kokoro soundfile numpy
+Setup:
+    pip install -r requirements.txt
 
 Usage:
     python epub_to_audiobook.py mybook.epub
+    python epub_to_audiobook.py mybook.epub --voice af_heart --language f  # French
     python epub_to_audiobook.py mybook.epub --voice af_heart --output ./audiobook
+    python epub_to_audiobook.py ./books  # Process all .epub files in a folder
+    
+Language codes: 'a' (American English), 'b' (British), 'f' (French), 'z' (German), etc.
 """
 
 import argparse
@@ -114,12 +118,10 @@ def synthesize_chapter(text: str, voice: str, output_path: Path, pipeline):
         f'ffmpeg -y -i "{wav_path}" -codec:a libmp3lame -qscale:a 4 "{mp3_path}" -loglevel quiet'
     )
     if ffmpeg_result == 0:
-        wav_path.unlink()  # Remove WAV after successful conversion
-        print(f"    Saved: {mp3_path.name}          ")
+        print(f"    Saved: {mp3_path.name} & {wav_path.name}          ")
     else:
         # Keep WAV if ffmpeg not available
-        wav_path.rename(output_path.with_suffix(".wav"))
-        print(f"    Saved: {output_path.with_suffix('.wav').name} (install ffmpeg for MP3)")
+        print(f"    Saved: {wav_path.name} (install ffmpeg for MP3)")
 
 
 def chunk_text(text: str, max_words: int = 400) -> list[str]:
@@ -164,10 +166,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Convert epub to audiobook MP3s using Kokoro TTS"
     )
-    parser.add_argument("epub", help="Path to the input .epub file")
+    parser.add_argument("path", help="Path to a .epub file or directory containing .epub files")
     parser.add_argument(
         "--voice", default="af_heart",
         help=f"Kokoro voice to use. Options: {', '.join(AVAILABLE_VOICES)} (default: af_heart)"
+    )
+    parser.add_argument(
+        "--language", default="a",
+        help="Language code: 'a' (American English), 'b' (British), 'f' (French), etc. (default: a)"
     )
     parser.add_argument(
         "--output", default=None,
@@ -185,12 +191,46 @@ def main():
             print(f"  {v}")
         sys.exit(0)
 
-    epub_path = Path(args.epub)
-    if not epub_path.exists():
-        print(f"Error: File not found: {epub_path}")
+    input_path = Path(args.path)
+    if not input_path.exists():
+        print(f"Error: File or directory not found: {input_path}")
         sys.exit(1)
 
-    output_dir = Path(args.output) if args.output else epub_path.parent / f"{epub_path.stem}_audiobook"
+    # Collect all epub files to process
+    epub_files = []
+    if input_path.is_file():
+        if input_path.suffix.lower() == ".epub":
+            epub_files = [input_path]
+        else:
+            print(f"Error: {input_path} is not an .epub file")
+            sys.exit(1)
+    elif input_path.is_dir():
+        epub_files = sorted(input_path.glob("*.epub"))
+        if not epub_files:
+            print(f"Error: No .epub files found in {input_path}")
+            sys.exit(1)
+    else:
+        print(f"Error: {input_path} is neither a file nor directory")
+        sys.exit(1)
+
+    # Load Kokoro once for all files
+    print(f"🔊 Loading Kokoro TTS (voice: {args.voice}, language: {args.language})...")
+    try:
+        from kokoro import KPipeline
+        pipeline = KPipeline(lang_code=args.language)
+    except Exception as e:
+        print(f"Error loading Kokoro: {e}")
+        print("Make sure you've installed it: pip install kokoro")
+        sys.exit(1)
+
+    # Process each epub file
+    for epub_path in epub_files:
+        process_epub(epub_path, args.voice, args.output, pipeline)
+
+
+def process_epub(epub_path: Path, voice: str, output_base: str, pipeline):
+    """Process a single epub file."""
+    output_dir = Path(output_base) if output_base else epub_path.parent / f"{epub_path.stem}_audiobook"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n📖 Loading epub: {epub_path.name}")
@@ -199,41 +239,31 @@ def main():
 
     if not chapters:
         print("Error: No readable chapters found in epub.")
-        sys.exit(1)
-
-    print(f"🔊 Loading Kokoro TTS (voice: {args.voice})...")
-    try:
-        from kokoro import KPipeline
-        pipeline = KPipeline(lang_code="a")  # 'a' = American English
-    except Exception as e:
-        print(f"Error loading Kokoro: {e}")
-        print("Make sure you've installed it: pip install kokoro")
-        sys.exit(1)
+        return
 
     generated_files = []
 
     for i, chapter in enumerate(chapters):
         filename_stem = f"{i+1:02d}_{sanitize_filename(chapter['title'])}"
         output_path = output_dir / filename_stem
-        ext = ".mp3"  # Will fall back to .wav if ffmpeg missing
 
         print(f"[{i+1}/{len(chapters)}] {chapter['title']}")
 
         try:
-            synthesize_chapter(chapter["text"], args.voice, output_path, pipeline)
-            # Record whichever file was actually saved
+            synthesize_chapter(chapter["text"], voice, output_path, pipeline)
+            # Record whichever files were saved (both MP3 and WAV now)
             mp3 = output_path.with_suffix(".mp3")
             wav = output_path.with_suffix(".wav")
             if mp3.exists():
                 generated_files.append(mp3.name)
-            elif wav.exists():
+            if wav.exists():
                 generated_files.append(wav.name)
         except Exception as e:
             print(f"    [Error] Skipping chapter: {e}")
 
     write_playlist(output_dir, generated_files)
 
-    print(f"\n✅ Done! {len(generated_files)} chapters saved to:")
+    print(f"\n✅ Done! Files saved to:")
     print(f"   {output_dir.resolve()}\n")
     print("📱 To use on Kindle:")
     print("   1. Connect Kindle via USB")
