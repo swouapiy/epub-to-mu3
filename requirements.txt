@@ -3,3 +3,4 @@ beautifulsoup4
 kokoro
 soundfile
 numpy
+mutagen
