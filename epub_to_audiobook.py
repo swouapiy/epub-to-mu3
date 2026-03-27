@@ -11,10 +11,12 @@ Setup:
 Usage:
     python epub_to_audiobook.py mybook.epub
     python epub_to_audiobook.py mybook.epub --voice af_heart --language f  # French
+    python epub_to_audiobook.py mybook.epub --speed 0.5  # Slower reading
     python epub_to_audiobook.py mybook.epub --voice af_heart --output ./audiobook
     python epub_to_audiobook.py ./books  # Process all .epub files in a folder
     
 Language codes: 'a' (American English), 'b' (British), 'f' (French), 'z' (German), etc.
+Speed: 0.5 (slow), 0.8 (slower, default), 1.0 (normal), 2.0 (fast)
 """
 
 import argparse
@@ -45,6 +47,9 @@ from ebooklib import epub
 from bs4 import BeautifulSoup
 import soundfile as sf
 import numpy as np
+from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, APIC
+import io
 
 # ── Text extraction ──────────────────────────────────────────────────────────
 
@@ -86,10 +91,65 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+# ── Cover extraction ─────────────────────────────────────────────────────────
+
+def extract_cover(epub_path: str) -> bytes | None:
+    """Extract the cover image from epub. Tries JPEG first, then PNG."""
+    try:
+        book = epub.read_epub(epub_path)
+        
+        # Try to find cover in manifest
+        for item in book.get_items():
+            if "cover" in item.get_name().lower():
+                mimetype = item.get_type()
+                if mimetype in ["image/jpeg", "image/png"]:
+                    return item.get_body_content()
+        
+        # Try images by type
+        for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+            mimetype = item.get_type()
+            if mimetype in ["image/jpeg", "image/png"]:
+                return item.get_body_content()
+        
+        return None
+    except Exception as e:
+        print(f"    [Warning] Could not extract cover: {e}")
+        return None
+
+
+def embed_cover_to_mp3(mp3_path: Path, cover_data: bytes) -> None:
+    """Embed cover image into MP3 file as ID3 tag."""
+    if not cover_data:
+        return
+    
+    try:
+        audio = MP3(str(mp3_path), ID3=ID3)
+        
+        # Detect image type
+        if cover_data[:3] == b'\xff\xd8\xff':
+            mime_type = "image/jpeg"
+        elif cover_data[:4] == b'\x89PNG':
+            mime_type = "image/png"
+        else:
+            return
+        
+        # Add cover art
+        audio["APIC"] = APIC(
+            encoding=3,
+            mime=mime_type,
+            type=3,  # Cover front
+            desc="Cover",
+            data=cover_data
+        )
+        audio.save()
+    except Exception as e:
+        print(f"    [Warning] Could not embed cover: {e}")
+
+
 # ── TTS synthesis ────────────────────────────────────────────────────────────
 
-def synthesize_chapter(text: str, voice: str, output_path: Path, pipeline):
-    """Use Kokoro to generate audio for a chapter and save as MP3."""
+def synthesize_chapter(text: str, voice: str, speed: float, output_path: Path, pipeline, cover_data: bytes | None = None):
+    """Use Kokoro to generate audio for a chapter and save as MP3 + WAV."""
     import soundfile as sf
 
     # Kokoro works best with chunks under ~500 words
@@ -98,7 +158,7 @@ def synthesize_chapter(text: str, voice: str, output_path: Path, pipeline):
 
     for i, chunk in enumerate(chunks):
         print(f"    Synthesizing chunk {i+1}/{len(chunks)}...", end="\r")
-        generator = pipeline(chunk, voice=voice)
+        generator = pipeline(chunk, voice=voice, speed=speed)
         for _, _, audio in generator:
             audio_segments.append(audio)
 
@@ -118,6 +178,9 @@ def synthesize_chapter(text: str, voice: str, output_path: Path, pipeline):
         f'ffmpeg -y -i "{wav_path}" -codec:a libmp3lame -qscale:a 4 "{mp3_path}" -loglevel quiet'
     )
     if ffmpeg_result == 0:
+        # Embed cover art if available
+        if cover_data:
+            embed_cover_to_mp3(mp3_path, cover_data)
         print(f"    Saved: {mp3_path.name} & {wav_path.name}          ")
     else:
         # Keep WAV if ffmpeg not available
@@ -176,6 +239,10 @@ def main():
         help="Language code: 'a' (American English), 'b' (British), 'f' (French), etc. (default: a)"
     )
     parser.add_argument(
+        "--speed", type=float, default=0.8,
+        help="Speech speed: 0.5 (slow), 0.8 (slower), 1.0 (normal), 2.0 (fast) (default: 0.8)"
+    )
+    parser.add_argument(
         "--output", default=None,
         help="Output directory (default: <epub_name>_audiobook/)"
     )
@@ -225,13 +292,19 @@ def main():
 
     # Process each epub file
     for epub_path in epub_files:
-        process_epub(epub_path, args.voice, args.output, pipeline)
+        process_epub(epub_path, args.voice, args.speed, args.output, pipeline)
 
 
-def process_epub(epub_path: Path, voice: str, output_base: str, pipeline):
+def process_epub(epub_path: Path, voice: str, speed: float, output_base: str, pipeline):
     """Process a single epub file."""
     output_dir = Path(output_base) if output_base else epub_path.parent / f"{epub_path.stem}_audiobook"
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create separate subdirectories for MP3 and WAV
+    mp3_dir = output_dir / "mp3"
+    wav_dir = output_dir / "wav"
+    mp3_dir.mkdir(exist_ok=True)
+    wav_dir.mkdir(exist_ok=True)
 
     print(f"\n📖 Loading epub: {epub_path.name}")
     chapters = extract_chapters(str(epub_path))
@@ -241,33 +314,61 @@ def process_epub(epub_path: Path, voice: str, output_base: str, pipeline):
         print("Error: No readable chapters found in epub.")
         return
 
+    # Extract cover once
+    cover_data = extract_cover(str(epub_path))
+    if cover_data:
+        print(f"   Cover extracted ({len(cover_data)} bytes)\n")
+
     generated_files = []
 
-    for i, chapter in enumerate(chapters):
-        filename_stem = f"{i+1:02d}_{sanitize_filename(chapter['title'])}"
-        output_path = output_dir / filename_stem
+    for i, chapter in enumerate(chapters, 1):
+        chapter_num = f"{i:02d}"
+        chapter_name = sanitize_filename(chapter['title'])
+        
+        # Save files to appropriate directories
+        mp3_filename = f"{chapter_num}_{chapter_name}"
+        wav_filename = f"{chapter_num}_{chapter_name}"
+        
+        mp3_path = mp3_dir / mp3_filename
+        wav_path = wav_dir / wav_filename
 
-        print(f"[{i+1}/{len(chapters)}] {chapter['title']}")
+        print(f"[{i}/{len(chapters)}] {chapter['title']}")
 
         try:
-            synthesize_chapter(chapter["text"], voice, output_path, pipeline)
-            # Record whichever files were saved (both MP3 and WAV now)
-            mp3 = output_path.with_suffix(".mp3")
-            wav = output_path.with_suffix(".wav")
-            if mp3.exists():
-                generated_files.append(mp3.name)
-            if wav.exists():
-                generated_files.append(wav.name)
+            # Use mp3_path as the output (both mp3 and wav will be created with proper dirs)
+            # But we need to handle them separately since they go to different folders
+            
+            # Create a temp path for synthesis, then move files
+            temp_output = output_dir / mp3_filename
+            synthesize_chapter(chapter["text"], voice, speed, temp_output, pipeline, cover_data)
+            
+            # Move files to correct directories
+            temp_mp3 = temp_output.with_suffix(".mp3")
+            temp_wav = temp_output.with_suffix(".wav")
+            
+            if temp_mp3.exists():
+                mp3_final = mp3_path.with_suffix(".mp3")
+                temp_mp3.rename(mp3_final)
+                generated_files.append((mp3_final.name, "mp3"))
+            
+            if temp_wav.exists():
+                wav_final = wav_path.with_suffix(".wav")
+                temp_wav.rename(wav_final)
+                generated_files.append((wav_final.name, "wav"))
+                
         except Exception as e:
             print(f"    [Error] Skipping chapter: {e}")
 
-    write_playlist(output_dir, generated_files)
+    # Write playlists for each format
+    write_playlist(mp3_dir, [f for f, fmt in generated_files if fmt == "mp3"])
+    write_playlist(wav_dir, [f for f, fmt in generated_files if fmt == "wav"])
 
     print(f"\n✅ Done! Files saved to:")
-    print(f"   {output_dir.resolve()}\n")
+    print(f"   📁 {mp3_dir.resolve()}")
+    print(f"   📁 {wav_dir.resolve()}\n")
     print("📱 To use on Kindle:")
     print("   1. Connect Kindle via USB")
-    print("   2. Copy the output folder to your Kindle's 'music' or 'audiobooks' directory")
+    print("   2. Copy the mp3/ folder to your Kindle's 'music' or 'audiobooks' directory")
     print("   3. Play with KOReader's music player or a KUAL audio extension\n")
 
 
