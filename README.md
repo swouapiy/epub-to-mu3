@@ -4,7 +4,8 @@ Convert EPUB files to MP3 + WAV audiobook chapters using **Kokoro TTS**. Perfect
 
 ## Features
 
-✨ **Multi-format output** – Generates both MP3 and WAV files for each chapter  
+✨ **Separate folders** – MP3 and WAV files organized in separate directories  
+✨ **Cover art in MP3s** – Book cover automatically embedded in each MP3 file  
 📚 **Batch processing** – Convert a single EPUB or an entire folder of EPUBs at once  
 🌍 **Multi-language support** – English, French, German, and more  
 🎤 **Multiple voices** – Choose from 11 different voices  
@@ -50,6 +51,13 @@ python epub_to_audiobook.py mybook.epub --voice af_bella
 python epub_to_audiobook.py mybook.epub --language f --voice af_heart
 ```
 
+### Adjust reading speed
+```bash
+python epub_to_audiobook.py mybook.epub --speed 0.5  # Very slow
+python epub_to_audiobook.py mybook.epub --speed 0.8  # Slower (default)
+python epub_to_audiobook.py mybook.epub --speed 1.0  # Normal speed
+```
+
 ### Batch convert folder
 ```bash
 python epub_to_audiobook.py ./books  # Converts all .epub files
@@ -72,6 +80,7 @@ python epub_to_audiobook.py --list-voices
 | `path` | - | Path to `.epub` file or folder containing `.epub` files |
 | `--voice` | `af_heart` | Kokoro voice (see available voices below) |
 | `--language` | `a` | Language code: `a` (US English), `b` (British), `f` (French), `z` (German) |
+| `--speed` | `0.8` | Speech speed: `0.5` (slow), `0.8` (slower), `1.0` (normal), `2.0` (fast) |
 | `--output` | `<epub_name>_audiobook/` | Output directory for audio files |
 | `--list-voices` | - | Show available voices and exit |
 
@@ -90,12 +99,20 @@ Mixed:
 
 ```
 my_audiobook_folder/
-├── 01_Chapter_One.mp3
-├── 01_Chapter_One.wav
-├── 02_Chapter_Two.mp3
-├── 02_Chapter_Two.wav
-└── playlist.m3u
+├── mp3/
+│   ├── 01_Chapter_One.mp3  (with embedded cover art)
+│   ├── 02_Chapter_Two.mp3  (with embedded cover art)
+│   ├── 03_Chapter_Three.mp3
+│   └── playlist.m3u
+└── wav/
+    ├── 01_Chapter_One.wav
+    ├── 02_Chapter_Two.wav
+    ├── 03_Chapter_Three.wav
+    └── playlist.m3u
 ```
+
+**Note:** MP3 files automatically include the book cover as metadata. This will display in music players, car stereos, and audiobook apps when playing.
+WAV files are kept separate for archival or other uses.
 
 ## Using on Kindle
 
