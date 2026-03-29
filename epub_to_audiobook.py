@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 epub_to_audiobook.py
 --------------------
@@ -8,39 +9,47 @@ Outputs are ready to copy to a Kindle.
 Setup:
     pip install -r requirements.txt
 
-Usage:
+Basic Usage:
     python epub_to_audiobook.py mybook.epub
     python epub_to_audiobook.py mybook.epub --voice af_heart --language f  # French
-    python epub_to_audiobook.py mybook.epub --speed 0.5  # Slower reading
-    python epub_to_audiobook.py mybook.epub --voice af_heart --output ./audiobook
+    python epub_to_audiobook.py mybook.epub --speed 1.0  # Normal speed
+    python epub_to_audiobook.py mybook.epub --quality 2  # Higher quality MP3
     python epub_to_audiobook.py ./books  # Process all .epub files in a folder
+
+Advanced Usage:
+    # Save current settings as default
+    python epub_to_audiobook.py book.epub --voice bm_george --quality 2 --save-config
     
+    # Resume from interrupted job
+    python epub_to_audiobook.py book.epub --resume
+    
+    # Start fresh (clear progress)
+    python epub_to_audiobook.py book.epub --restart
+    
+    # Use custom config file
+    python epub_to_audiobook.py book.epub --config /path/to/config.json
+
+Config File (~/.audiobook_config.json):
+    {
+      "voice": "af_heart",
+      "language": "a",
+      "speed": 0.8,
+      "quality": 4
+    }
+
 Language codes: 'a' (American English), 'b' (British), 'f' (French), 'z' (German), etc.
-Speed: 0.5 (slow), 0.8 (slower, default), 1.0 (normal), 2.0 (fast)
+Speed: 0.5 (slow), 0.8 (slower), 1.0 (normal), 2.0 (fast)
+Quality: 0-1 (high), 4 (good/default), 9 (low)
 """
 
+
 import argparse
+import json
 import os
 import re
 import sys
 from pathlib import Path
-
-# ── Dependency check ────────────────────────────────────────────────────────
-def check_deps():
-    missing = []
-    for pkg in ["ebooklib", "bs4", "kokoro", "soundfile", "numpy"]:
-        try:
-            __import__(pkg)
-        except ImportError:
-            missing.append(pkg)
-    if missing:
-        print("Missing dependencies. Run:\n")
-        pip_names = {"bs4": "beautifulsoup4"}
-        pkgs = " ".join(pip_names.get(p, p) for p in missing)
-        print(f"  pip install {pkgs}\n")
-        sys.exit(1)
-
-check_deps()
+from typing import Optional
 
 import ebooklib
 from ebooklib import epub
@@ -81,19 +90,43 @@ def extract_chapters(epub_path: str) -> list[dict]:
 
 
 def clean_text(text: str) -> str:
-    """Remove noise from extracted text."""
+    """Remove noise from extracted text with improved filtering."""
     # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
-    # Remove lines that are just numbers (page numbers)
-    text = re.sub(r"(?<!\w)\d{1,4}(?!\w)", "", text)
-    # Remove common epub artifacts
+    
+    # Remove common epub artifacts (brackets, braces)
     text = re.sub(r"\[.*?\]", "", text)
-    return text.strip()
+    text = re.sub(r"\{.*?\}", "", text)
+    
+    # Remove page numbers (standalone numbers at word boundaries)
+    text = re.sub(r"\b\d{1,4}\b", "", text)
+    
+    # Remove chapter numbers like "Chapter 1", "C1", etc.
+    text = re.sub(r"(?:chapter|ch|c|part|p)\s*\d+", "", text, flags=re.IGNORECASE)
+    
+    # Remove common headers/footers (centered text patterns)
+    text = re.sub(r"^\s*-+\s*$", "", text, flags=re.MULTILINE)
+    
+    # Remove repeated punctuation
+    text = re.sub(r"\.{2,}", ".", text)
+    text = re.sub(r"!{2,}", "!", text)
+    text = re.sub(r"\?{2,}", "?", text)
+    
+    # Remove URLs
+    text = re.sub(r"http[s]?://\S+", "", text)
+    
+    # Remove leading/trailing punctuation from lines
+    text = re.sub(r"^[.,;:!?—–-]+\s+|[.,;:!?—–-]+$", "", text, flags=re.MULTILINE)
+    
+    # Final cleanup of extra spaces
+    text = re.sub(r"\s+", " ", text).strip()
+    
+    return text
 
 
 # ── Cover extraction ─────────────────────────────────────────────────────────
 
-def extract_cover(epub_path: str) -> bytes | None:
+def extract_cover(epub_path: str) -> Optional[bytes]:
     """Extract the cover image from epub. Tries JPEG first, then PNG."""
     try:
         book = epub.read_epub(epub_path)
@@ -148,8 +181,13 @@ def embed_cover_to_mp3(mp3_path: Path, cover_data: bytes) -> None:
 
 # ── TTS synthesis ────────────────────────────────────────────────────────────
 
-def synthesize_chapter(text: str, voice: str, speed: float, output_path: Path, pipeline, cover_data: bytes | None = None):
-    """Use Kokoro to generate audio for a chapter and save as MP3 + WAV."""
+def synthesize_chapter(text: str, voice: str, speed: float, output_path: Path, pipeline, quality: int = 4, cover_data: Optional[bytes] = None):
+    """Use Kokoro to generate audio for a chapter and save as MP3 + WAV.
+    
+    Args:
+        quality: MP3 quality (0-9, lower is better). Default 4 (good balance).
+                 0-1 = high quality, 4 = good quality, 9 = low quality
+    """
     import soundfile as sf
 
     # Kokoro works best with chunks under ~500 words
@@ -175,7 +213,7 @@ def synthesize_chapter(text: str, voice: str, speed: float, output_path: Path, p
     # Try converting to MP3 (smaller, Kindle-friendly)
     mp3_path = output_path.with_suffix(".mp3")
     ffmpeg_result = os.system(
-        f'ffmpeg -y -i "{wav_path}" -codec:a libmp3lame -qscale:a 4 "{mp3_path}" -loglevel quiet'
+        f'ffmpeg -y -i "{wav_path}" -codec:a libmp3lame -qscale:a {quality} "{mp3_path}" -loglevel quiet'
     )
     if ffmpeg_result == 0:
         # Embed cover art if available
@@ -206,6 +244,87 @@ def chunk_text(text: str, max_words: int = 400) -> list[str]:
     return chunks
 
 
+# ── Config file handling ─────────────────────────────────────────────────────
+
+def load_config(config_path: Optional[str] = None) -> dict:
+    """Load config from ~/.audiobook_config.json or specified path."""
+    if config_path is None:
+        config_path = Path.home() / ".audiobook_config.json"
+    else:
+        config_path = Path(config_path)
+    
+    defaults = {
+        "voice": "af_heart",
+        "language": "a",
+        "speed": 0.8,
+        "quality": 4
+    }
+    
+    if config_path.exists():
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            # Merge with defaults (config overrides defaults)
+            defaults.update(config)
+            print(f"📋 Config loaded from: {config_path}")
+            return defaults
+        except Exception as e:
+            print(f"⚠️  Warning: Could not load config from {config_path}: {e}")
+    
+    return defaults
+
+
+def save_config(config: dict, config_path: Optional[str] = None) -> None:
+    """Save current settings to config file."""
+    if config_path is None:
+        config_path = Path.home() / ".audiobook_config.json"
+    else:
+        config_path = Path(config_path)
+    
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"✅ Config saved to: {config_path}")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not save config: {e}")
+
+
+# ── Progress tracking ────────────────────────────────────────────────────────
+
+def load_progress(epub_path: Path) -> set:
+    """Load list of already-processed chapters."""
+    progress_file = epub_path.parent / f".{epub_path.stem}_progress.json"
+    
+    if progress_file.exists():
+        try:
+            with open(progress_file, 'r') as f:
+                data = json.load(f)
+            return set(data.get("completed", []))
+        except Exception as e:
+            print(f"⚠️  Warning: Could not load progress: {e}")
+    
+    return set()
+
+
+def save_progress(epub_path: Path, completed_indices: set) -> None:
+    """Save progress of processed chapters."""
+    progress_file = epub_path.parent / f".{epub_path.stem}_progress.json"
+    
+    try:
+        with open(progress_file, 'w') as f:
+            json.dump({"completed": sorted(list(completed_indices))}, f)
+    except Exception as e:
+        print(f"⚠️  Warning: Could not save progress: {e}")
+
+
+def clear_progress(epub_path: Path) -> None:
+    """Clear progress file (useful for starting fresh)."""
+    progress_file = epub_path.parent / f".{epub_path.stem}_progress.json"
+    if progress_file.exists():
+        progress_file.unlink()
+        print(f"🔄 Progress cleared for {epub_path.name}")
+
+
 # ── Playlist ─────────────────────────────────────────────────────────────────
 
 def write_playlist(output_dir: Path, filenames: list[str]):
@@ -226,25 +345,48 @@ AVAILABLE_VOICES = [
 ]
 
 def main():
+    # Load config first to use as defaults
+    config = load_config()
+    
     parser = argparse.ArgumentParser(
         description="Convert epub to audiobook MP3s using Kokoro TTS"
     )
     parser.add_argument("path", help="Path to a .epub file or directory containing .epub files")
     parser.add_argument(
-        "--voice", default="af_heart",
-        help=f"Kokoro voice to use. Options: {', '.join(AVAILABLE_VOICES)} (default: af_heart)"
+        "--voice", default=config["voice"],
+        help=f"Kokoro voice to use. Options: {', '.join(AVAILABLE_VOICES)} (default: {config['voice']})"
     )
     parser.add_argument(
-        "--language", default="a",
-        help="Language code: 'a' (American English), 'b' (British), 'f' (French), etc. (default: a)"
+        "--language", default=config["language"],
+        help=f"Language code: 'a' (American), 'b' (British), 'f' (French), etc. (default: {config['language']})"
     )
     parser.add_argument(
-        "--speed", type=float, default=0.8,
-        help="Speech speed: 0.5 (slow), 0.8 (slower), 1.0 (normal), 2.0 (fast) (default: 0.8)"
+        "--speed", type=float, default=config["speed"],
+        help=f"Speech speed: 0.5 (slow), 0.8 (slower), 1.0 (normal), 2.0 (fast) (default: {config['speed']})"
+    )
+    parser.add_argument(
+        "--quality", type=int, default=config["quality"],
+        help=f"MP3 quality: 0-1 (high), 4 (good, default), 9 (low) (default: {config['quality']})"
     )
     parser.add_argument(
         "--output", default=None,
         help="Output directory (default: <epub_name>_audiobook/)"
+    )
+    parser.add_argument(
+        "--config", default=None,
+        help="Path to config file (default: ~/.audiobook_config.json)"
+    )
+    parser.add_argument(
+        "--save-config", action="store_true",
+        help="Save current settings to config file for future use"
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Resume processing from last unfinished chapter (skips completed chapters)"
+    )
+    parser.add_argument(
+        "--restart", action="store_true",
+        help="Clear progress and start fresh"
     )
     parser.add_argument(
         "--list-voices", action="store_true",
@@ -280,6 +422,16 @@ def main():
         print(f"Error: {input_path} is neither a file nor directory")
         sys.exit(1)
 
+    # Save config if requested
+    if args.save_config:
+        config_to_save = {
+            "voice": args.voice,
+            "language": args.language,
+            "speed": args.speed,
+            "quality": args.quality
+        }
+        save_config(config_to_save, args.config)
+
     # Load Kokoro once for all files
     print(f"🔊 Loading Kokoro TTS (voice: {args.voice}, language: {args.language})...")
     try:
@@ -292,11 +444,15 @@ def main():
 
     # Process each epub file
     for epub_path in epub_files:
-        process_epub(epub_path, args.voice, args.speed, args.output, pipeline)
+        if args.restart:
+            clear_progress(epub_path)
+        
+        process_epub(epub_path, args.voice, args.speed, args.quality, args.output, 
+                    args.resume, pipeline)
 
 
-def process_epub(epub_path: Path, voice: str, speed: float, output_base: str, pipeline):
-    """Process a single epub file."""
+def process_epub(epub_path: Path, voice: str, speed: float, quality: int, output_base: str, enable_resume: bool, pipeline):
+    """Process a single epub file with optional resume capability."""
     output_dir = Path(output_base) if output_base else epub_path.parent / f"{epub_path.stem}_audiobook"
     output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -314,6 +470,11 @@ def process_epub(epub_path: Path, voice: str, speed: float, output_base: str, pi
         print("Error: No readable chapters found in epub.")
         return
 
+    # Load progress if resuming
+    completed = load_progress(epub_path) if enable_resume else set()
+    if enable_resume and completed:
+        print(f"📍 Resuming from chapter {max(completed) + 2} (already have {len(completed)} chapters)\n")
+
     # Extract cover once
     cover_data = extract_cover(str(epub_path))
     if cover_data:
@@ -322,6 +483,11 @@ def process_epub(epub_path: Path, voice: str, speed: float, output_base: str, pi
     generated_files = []
 
     for i, chapter in enumerate(chapters, 1):
+        # Skip if already processed
+        if enable_resume and (i - 1) in completed:
+            print(f"[{i}/{len(chapters)}] {chapter['title']} (skipped - already done)")
+            continue
+        
         chapter_num = f"{i:02d}"
         chapter_name = sanitize_filename(chapter['title'])
         
@@ -335,12 +501,9 @@ def process_epub(epub_path: Path, voice: str, speed: float, output_base: str, pi
         print(f"[{i}/{len(chapters)}] {chapter['title']}")
 
         try:
-            # Use mp3_path as the output (both mp3 and wav will be created with proper dirs)
-            # But we need to handle them separately since they go to different folders
-            
             # Create a temp path for synthesis, then move files
             temp_output = output_dir / mp3_filename
-            synthesize_chapter(chapter["text"], voice, speed, temp_output, pipeline, cover_data)
+            synthesize_chapter(chapter["text"], voice, speed, temp_output, pipeline, quality, cover_data)
             
             # Move files to correct directories
             temp_mp3 = temp_output.with_suffix(".mp3")
@@ -355,9 +518,17 @@ def process_epub(epub_path: Path, voice: str, speed: float, output_base: str, pi
                 wav_final = wav_path.with_suffix(".wav")
                 temp_wav.rename(wav_final)
                 generated_files.append((wav_final.name, "wav"))
+            
+            # Mark as completed
+            completed.add(i - 1)
+            save_progress(epub_path, completed)
                 
         except Exception as e:
             print(f"    [Error] Skipping chapter: {e}")
+
+    # Clear progress on successful completion
+    if len(completed) == len(chapters):
+        clear_progress(epub_path)
 
     # Write playlists for each format
     write_playlist(mp3_dir, [f for f, fmt in generated_files if fmt == "mp3"])
