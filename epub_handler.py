@@ -31,26 +31,9 @@ def extract_chapters(epub_path: str) -> list[dict]:
     book = epub.read_epub(epub_path)
     chapters = []
 
-    # Get spine order for better chapter ordering
-    spine = book.spine if hasattr(book, 'spine') else []
-    
-    # Process items in spine order when available
-    items_to_process = []
-    if spine:
-        for spine_item in spine:
-            if isinstance(spine_item, tuple):
-                item_id = spine_item[0]
-            else:
-                item_id = str(spine_item)
-            
-            item = book.get_item(item_id)
-            if item and item.get_type() == ebooklib.ITEM_DOCUMENT:
-                items_to_process.append(item)
-    
-    # Fallback: process all document items
-    if not items_to_process:
-        items_to_process = [item for item in book.get_items() 
-                           if item.get_type() == ebooklib.ITEM_DOCUMENT]
+    # Get all document items (chapters/sections)
+    items = book.get_items_of_type(ebooklib.ITEM_DOCUMENT)
+    items_to_process = list(items)
 
     for item in items_to_process:
         soup = BeautifulSoup(item.get_body_content(), "html.parser")
